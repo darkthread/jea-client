@@ -2,7 +2,7 @@
 
 ## 概觀
 
-`Manage-JEAEndpoint.ps1` 是一支 PowerShell 管理腳本，用於在 Windows 伺服器上管理 **Just Enough Administration（JEA）** 工作階段設定（Session Configuration）的完整生命週期，涵蓋建立設定檔、向 WinRM 註冊、取消註冊、刪除設定檔、列出現有端點、啟用 WinRM HTTPS 接聽程式，以及匯出自我簽署憑證供用戶端信任。
+`Manage-JEAEndpoint.ps1` 是一支 PowerShell 管理腳本，用於在 Windows 伺服器上管理 **Just Enough Administration（JEA）** 工作階段設定（Session Configuration）的完整生命週期，涵蓋建立設定檔、向 WinRM 註冊、取消註冊、刪除設定檔、列出現有端點、啟用 WinRM HTTPS 接聽程式、匯出自我簽署憑證供用戶端信任，以及檢視與替換 WinRM HTTPS 所使用的憑證。
 
 > **參考文件**：[Just Enough Administration - PowerShell | Microsoft Learn](https://learn.microsoft.com/powershell/scripting/security/remoting/jea/overview)
 
@@ -31,7 +31,9 @@
 | **Delete** | `-Delete` | 刪除模組目錄及其中所有 JEA 設定檔 |
 | **List** | `-List` | 列出本機已註冊的所有 JEA 工作階段設定 |
 | **EnableHttps** | `-EnableHttps` | 建立 WinRM HTTPS 接聽程式並設定防火牆規則 |
-| **ExportSelfSignedCert** | `-ExportSelfSignedCert` | 找到 WinRM HTTPS 目前使用的自我簽署憑證並匯出為 .cer，供用戶端匯入信任 |
+| **ShowHttpsCert** | `-ShowHttpsCert` | 顯示 WinRM HTTPS Listener 目前使用憑證的詳細資訊 |
+| **ReplaceHttpsCert** | `-ReplaceHttpsCert` | 將 WinRM HTTPS Listener 的憑證原地替換為新憑證（不需重建 Listener） |
+| **ExportCert** | `-ExportCert` | 找到 WinRM HTTPS 目前使用的自我簽署憑證並匯出為 .cer，供用戶端匯入信任 |
 
 ---
 
@@ -87,12 +89,27 @@
 | `-Port` | `Int` | 否 | `5986` | WinRM HTTPS 接聽埠，有效範圍 1–65535。 |
 | `-ExportCert` | `String` | 否 | — | 同步將憑證匯出為 .cer 檔案的完整路徑，供用戶端以 `Import-Certificate` 匯入信任後直接連線（不需 `-SkipCACheck`）。 |
 
-### ExportSelfSignedCert 模式
+### ExportCert 模式
 
 | 參數 | 類型 | 必填 | 預設值 | 說明 |
 |---|---|---|---|---|
-| `-ExportSelfSignedCert` | `Switch` | 是 | — | 切換至 ExportSelfSignedCert 模式。 |
+| `-ExportCert` | `Switch` | 是 | — | 切換至 ExportCert 模式。 |
 | `-ExportPath` | `String` | 否 | `%TEMP%\WinRM-HTTPS.cer` | 匯出 .cer 檔案的完整路徑。匯出的是 DER 編碼的公鑰憑證，不含私鑰，可安全傳遞給用戶端。 |
+
+### ShowHttpsCert 模式
+
+| 參數 | 類型 | 必填 | 說明 |
+|---|---|---|---|
+| `-ShowHttpsCert` | `Switch` | 是 | 切換至 ShowHttpsCert 模式，對現行 WinRM HTTPS Listener 使用的憑證進行唯讀查詢。輸出包含 Listener 的 Address、Transport、Hostname、Port、Enabled，以及憑證的 Subject、Issuer、指紋、生效日、到期日、狀態、是否自簽、SAN 與 EKU。 |
+
+### ReplaceHttpsCert 模式
+
+| 參數 | 類型 | 必填 | 預設值 | 說明 |
+|---|---|---|---|---|
+| `-ReplaceHttpsCert` | `Switch` | 是 | — | 切換至 ReplaceHttpsCert 模式。使用 `Set-WSManInstance` 原地更新 Listener 的 `CertificateThumbprint`，不會刪除重建 Listener，現有 TCP 連線不受影響。 |
+| `-NewCertThumbprint` | `String` | 否 | （重新建立自簽憑證） | 位於 `Cert:\LocalMachine\My` 的新憑證指紋。推薦用於透過 CA 更新憑證的情境。省略時腳本會以 `-NewHostname` 重建一張 Self-Signed Certificate。 |
+| `-NewHostname` | `String` | 否 | （沿用現行 Listener 的 Hostname） | 重建自簽憑證時使用的 DNS 名稱。僅在未指定 `-NewCertThumbprint` 時生效。 |
+| `-RemoveOldCert` | `Switch` | 否 | — | 替換完成後刪除舊憑證。為避免誤刪 CA 簽發的憑證，**僅當舊憑證為自簽時才會實際刪除**，其餘情況顯示提示訊息並保留舊憑證。 |
 
 ---
 
@@ -100,7 +117,7 @@
 
 腳本支援 PowerShell 一般參數（Common Parameters）：
 
-- **`-WhatIf`**：預覽動作，不實際執行（適用於 Register、Unregister、Delete、EnableHttps 模式；ExportSelfSignedCert 模式不適用）。
+- **`-WhatIf`**：預覽動作，不實際執行（適用於 Register、Unregister、Delete、EnableHttps、ReplaceHttpsCert 模式；ShowHttpsCert 與 ExportCert 模式不適用）。
 - **`-Confirm`**：執行前要求確認。
 - **`-Verbose`**：顯示詳細執行訊息。
 
@@ -294,10 +311,10 @@ Enter-PSSession -ComputerName server01.corp.contoso.com `
 
 ```powershell
 # 匯出至預設路徑（%TEMP%\WinRM-HTTPS.cer）
-.\Manage-JEAEndpoint.ps1 -ExportSelfSignedCert
+.\Manage-JEAEndpoint.ps1 -ExportCert
 
 # 或指定路徑
-.\Manage-JEAEndpoint.ps1 -ExportSelfSignedCert -ExportPath 'C:\Share\PDC-WinRM.cer'
+.\Manage-JEAEndpoint.ps1 -ExportCert -ExportPath 'C:\Share\PDC-WinRM.cer'
 ```
 
 **步驟 2（用戶端，以系統管理員執行）**：將 .cer 匯入信任的根憑證授權單位：
@@ -328,7 +345,7 @@ Enter-PSSession -ComputerName PDC -UseSSL -ConfigurationName HelpDesk
 .\Manage-JEAEndpoint.ps1 -EnableHttps -ExportCert 'C:\Share\PDC-WinRM.cer'
 ```
 
-在首次啟用 WinRM HTTPS 的同時，自動將自我簽署憑證匯出至指定路徑，省去事後再執行 `-ExportSelfSignedCert` 的步驟。
+在首次啟用 WinRM HTTPS 的同時，自動將自我簽署憑證匯出至指定路徑，省去事後再執行 `-ExportCert` 的步驟。
 
 ---
 
@@ -400,6 +417,76 @@ Get-Item WSMan:\localhost\Client\TrustedHosts
 
 ---
 
+### 範例 16：檢視目前 WinRM HTTPS 使用的憑證
+
+```powershell
+.\Manage-JEAEndpoint.ps1 -ShowHttpsCert
+```
+
+輸出範例：
+
+```
+[ShowHttpsCert] WinRM HTTPS Listener 設定：
+  Address   : *
+  Transport : HTTPS
+  Hostname  : pdc.corp.contoso.com
+  Port      : 5986
+  Enabled   : true
+
+憑證詳細資訊：
+  Subject   : CN=pdc.corp.contoso.com
+  Issuer    : CN=pdc.corp.contoso.com
+  指紋      : F1E2D3C4B5A6...
+  生效日    : 2025-01-01 00:00
+  到期日    : 2028-01-01 00:00
+  狀態      : 有效（剩餘 730 天）
+  是否自簽  : True
+  SAN       : DNS Name=pdc.corp.contoso.com
+  EKU       : Server Authentication (1.3.6.1.5.5.7.3.1)
+```
+
+> 適合用於排查連線錯誤（例如憑證即將到期、Hostname 與用戶端不一致）時快速確認伺服器目前實際採用的憑證設定。
+
+---
+
+### 範例 17：更換 WinRM HTTPS 憑證
+
+#### 17a. 改用 CA 簽發的新憑證（推薦）
+
+```powershell
+# 先將新憑證匯入 Cert:\LocalMachine\My（例如透過 Import-PfxCertificate），取得指紋後：
+.\Manage-JEAEndpoint.ps1 -ReplaceHttpsCert -NewCertThumbprint 'A1B2C3D4E5F6...'
+```
+
+腳本會：
+
+1. 顯示現行憑證資訊（Subject、指紋、到期日）。
+2. 以 `Set-WSManInstance` 原地更新 Listener 的 `CertificateThumbprint`，**不會** 移除並重建 Listener，現有 TCP 連線不中斷。
+3. 顯示新憑證的 Subject、指紋、到期日，並列出後續連線指令範例。
+
+#### 17b. 重新建立 Self-Signed 憑證並替換（測試環境）
+
+```powershell
+# 沿用現行 Listener 的 Hostname 重新建立自簽憑證
+.\Manage-JEAEndpoint.ps1 -ReplaceHttpsCert
+
+# 或指定新的 DNS 名稱（例如改用 FQDN）
+.\Manage-JEAEndpoint.ps1 -ReplaceHttpsCert -NewHostname 'pdc.corp.contoso.com'
+
+# 替換完成後一併刪除舊的自簽憑證
+.\Manage-JEAEndpoint.ps1 -ReplaceHttpsCert -NewHostname 'pdc.corp.contoso.com' -RemoveOldCert
+```
+
+> **提醒**：更換自簽憑證後，先前已匯入用戶端 `Cert:\LocalMachine\Root` 的舊憑證將失效，需重新執行 `-ExportCert` 並在用戶端重新匯入，或改用 `-SkipCACheck -SkipCNCheck`。
+
+#### 17c. 預覽更換動作
+
+```powershell
+.\Manage-JEAEndpoint.ps1 -ReplaceHttpsCert -NewCertThumbprint 'A1B2C3D4E5F6...' -WhatIf
+```
+
+---
+
 ## 設定檔說明
 
 ### 角色能力檔（Role Capability File, .psrc）
@@ -451,5 +538,7 @@ WinRM 工作階段設定名稱  ←→  PowerShell 模組目錄名稱  ←→  .
 | `.pssc 檔案驗證失敗` | .pssc 格式錯誤 | 手動執行 `Test-PSSessionConfigurationFile -Path <path>` 檢查錯誤 |
 | 連線時提示找不到角色能力 | `EndpointName`、模組目錄名稱、.psrc 名稱不一致 | 確認三者完全相同，或刪除後重新執行 `Create` |
 | WinRM HTTPS 連線被拒 | 憑證缺少 Server Authentication EKU | 使用本腳本重新建立憑證，或手動確認憑證含有 OID `1.3.6.1.5.5.7.3.1` |
-| `Enter-PSSession -UseSSL` 拋出「SSL certificate is signed by an unknown certificate authority」 | 用戶端未信任伺服器的自我簽署憑證 | 在伺服器執行 `-ExportSelfSignedCert` 匯出憑證，再於用戶端以管理員執行 `Import-Certificate -FilePath <.cer路徑> -CertStoreLocation Cert:\LocalMachine\Root`；或暫時使用 `New-PSSessionOption -SkipCACheck -SkipCNCheck` |
+| `Enter-PSSession -UseSSL` 拋出「SSL certificate is signed by an unknown certificate authority」 | 用戶端未信任伺服器的自我簽署憑證 | 在伺服器執行 `-ExportCert` 匯出憑證，再於用戶端以管理員執行 `Import-Certificate -FilePath <.cer路徑> -CertStoreLocation Cert:\LocalMachine\Root`；或暫時使用 `New-PSSessionOption -SkipCACheck -SkipCNCheck` |
+| 想確認伺服器目前實際使用的 HTTPS 憑證 / 排查名稱不符 | 不確定 Listener 對應哪一張憑證 | 執行 `-ShowHttpsCert` 列出 Listener 設定與憑證的 Subject、SAN、到期日 |
+| 憑證即將到期或需要從自簽換成 CA 簽發 | 需要更換 Listener 使用的憑證 | 將新憑證匯入 `Cert:\LocalMachine\My` 後，執行 `-ReplaceHttpsCert -NewCertThumbprint <新指紋>`；測試環境可直接 `-ReplaceHttpsCert` 重新建立自簽 |
 | `Delete` 後端點仍可連線 | 未先執行 `Unregister`，WinRM 仍持有設定 | 執行 `-Unregister` 再執行 `-Delete` |
