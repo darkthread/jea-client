@@ -19,6 +19,37 @@
 
 ---
 
+## 取得腳本
+
+以下指令可直接在 PowerShell（**需以系統管理員身分執行**）中將腳本下載並存至本機：
+
+```powershell
+$url  = 'https://raw.githubusercontent.com/darkthread/jea-client/refs/heads/master/Manage-JEAEndpoint.ps1'
+$dest = 'C:\Scripts\Manage-JEAEndpoint.ps1'
+New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
+Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing
+Unblock-File -Path $dest
+```
+
+### 為什麼需要 `Unblock-File`？
+
+Windows 會在從網際網路下載的檔案上附加 **NTFS 替代資料流（Alternate Data Stream）** `Zone.Identifier`，將其標記為「來自網際網路（Zone 3）」。PowerShell 的 `Invoke-WebRequest` 同樣會寫入此標記。
+
+當執行原則為 `RemoteSigned` 或更嚴格時，PowerShell 會**拒絕執行**帶有此網際網路標記且未經數位簽章的腳本，並顯示類似下列的錯誤：
+
+```
+無法載入檔案 ... 因為在此系統上已停用指令碼執行。
+```
+
+`Unblock-File` 會移除 `Zone.Identifier` 資料流，使腳本視同「本機」檔案而可正常執行。執行前請確認已閱讀腳本內容，確保來源可信。
+
+> **替代方案**：若不想執行 `Unblock-File`，可改用 `-ExecutionPolicy Bypass` 旗標直接執行（不建議用於常設環境）：
+> ```powershell
+> powershell.exe -ExecutionPolicy Bypass -File C:\Scripts\Manage-JEAEndpoint.ps1 -List
+> ```
+
+---
+
 ## 執行模式總覽
 
 腳本透過參數集（Parameter Set）切換模式，每次執行只能使用一種模式。
