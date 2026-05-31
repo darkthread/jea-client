@@ -194,58 +194,104 @@ Param(
     [Parameter(ParameterSetName = 'EnableHttps')]
     [string]$ExportCert
 )
-$PSErrorActionPreference = 'Stop'  # 全局設定錯誤動作為 Stop，確保例外能被捕獲
-# ── 各模式共用路徑（.pssc 固定放在 Module 目錄，方便 Delete 一併清除）──
-# EnableHttps 模式下 EndpointName 為選填，僅在有值時計算路徑
+$ErrorActionPreference = 'Stop'
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+$Script:HttpsListenerSelector = @{ Address = '*'; Transport = 'HTTPS' }
+
+function Write-Step  { param($Msg) Write-Host $Msg -ForegroundColor Cyan }
+function Write-Done  { param($Msg) Write-Host "`n$Msg" -ForegroundColor Green }
+function Write-Hint  { param($Msg) Write-Host $Msg -ForegroundColor Yellow }
+function Write-Field { param($Label, $Value) Write-Host ("  {0,-10}: {1}" -f $Label, $Value) -ForegroundColor Gray }
+
+function Get-ModulePath {
+    param([Parameter(Mandatory)][string]$Name)
+    Join-Path "$env:ProgramFiles\WindowsPowerShell\Modules" $Name
+}
+
+function Get-DefaultPsscPath {
+    param([Parameter(Mandatory)][string]$Name)
+    Join-Path (Get-ModulePath $Name) "$Name.pssc"
+}
+
+# Get-WSManInstance 在資源不存在時拋出終止性例外，包成可回傳 $null 的函式。
+function Get-HttpsListener {
+    try   { Get-WSManInstance -ResourceURI 'winrm/config/Listener' -SelectorSet $Script:HttpsListenerSelector -ErrorAction Stop }
+    catch { $null }
+}
+
+function Export-CertToFile {
+    param(
+        [Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert,
+        [Parameter(Mandatory)][string]$Path
+    )
+    [System.IO.File]::WriteAllBytes(
+        $Path,
+        $Cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+    )
+    Write-Field '匯出路徑'  $Path
+    Write-Field '用戶端匯入' "Import-Certificate -FilePath '$Path' -CertStoreLocation Cert:\LocalMachine\Root"
+}
+
+function Write-ConnectionHint {
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][int]$Port,
+        [string]$EndpointName,
+        [bool]$IsSelfSigned
+    )
+    $cfg = if ($EndpointName) { " -ConfigurationName $EndpointName" } else { '' }
+    $baseCmd = "Enter-PSSession -ComputerName $ComputerName -UseSSL -Port $Port$cfg"
+
+    if (-not $IsSelfSigned) {
+        Write-Field '連線指令' $baseCmd
+        return
+    }
+
+    Write-Host "`n  ※ Self-Signed 憑證 — 用戶端需擇一處理 CA 信任：" -ForegroundColor Yellow
+    Write-Host '  選項 1 略過 CA 驗證（僅限內部可信環境）：'      -ForegroundColor Gray
+    Write-Host "    `$so = New-PSSessionOption -SkipCACheck -SkipCNCheck" -ForegroundColor Gray
+    Write-Host "    $baseCmd -SessionOption `$so"                  -ForegroundColor Gray
+    Write-Host '  選項 2 在用戶端匯入憑證後直接連線（建議）：'    -ForegroundColor Gray
+    Write-Host "    Import-Certificate -FilePath '<.cer 路徑>' -CertStoreLocation Cert:\LocalMachine\Root" -ForegroundColor Gray
+    Write-Host "    $baseCmd" -ForegroundColor Gray
+}
+
+# ── 模式共用路徑（EnableHttps / List / ExportSelfSignedCert 不需 EndpointName）
 if ($EndpointName) {
-    $modulePath      = "$env:ProgramFiles\WindowsPowerShell\Modules\$EndpointName"
-    $defaultPsscPath = Join-Path $modulePath "$EndpointName.pssc"
+    $modulePath      = Get-ModulePath $EndpointName
+    $defaultPsscPath = Get-DefaultPsscPath $EndpointName
 }
 
 switch ($PSCmdlet.ParameterSetName) {
 
-    # ════════════════════════════════════════════════════════════
-    # Create：建立 .psrc 與 .pssc
-    # ════════════════════════════════════════════════════════════
+    # ── Create：建立 .psrc 與 .pssc ─────────────────────────────────────
     'Create' {
-        # 1. 設定 JEA Role Capability 的模組路徑
-        # JEA 需要將 Role Capability 檔案放在有效 PS Module 路徑中的 'RoleCapabilities' 資料夾內。
-        $roleCapPath = Join-Path $modulePath "RoleCapabilities"
-
+        $roleCapPath = Join-Path $modulePath 'RoleCapabilities'
         if (-not (Test-Path $roleCapPath)) {
-            Write-Host "Creating module directory: $roleCapPath" -ForegroundColor Cyan
+            Write-Step "Creating module directory: $roleCapPath"
             New-Item -Path $roleCapPath -ItemType Directory -Force | Out-Null
-            # 建立一個假的 manifest，讓它能被識別為模組
             New-ModuleManifest -Path (Join-Path $modulePath "$EndpointName.psd1") `
-                               -RootModule "" -Description "JEA Module for $EndpointName" `
+                               -RootModule '' -Description "JEA Module for $EndpointName" `
                                -WarningAction SilentlyContinue
         }
 
-        # 2. 建立 Role Capability 檔案 (.psrc)
         $psrcFilePath = Join-Path $roleCapPath "$EndpointName.psrc"
-        Write-Host "Generating Role Capability File: $psrcFilePath" -ForegroundColor Cyan
-
-        New-PSRoleCapabilityFile -Path $psrcFilePath `
-                                 -VisibleCmdlets $CmdletList `
+        Write-Step "Generating Role Capability File: $psrcFilePath"
+        New-PSRoleCapabilityFile -Path $psrcFilePath -VisibleCmdlets $CmdletList `
                                  -Description "Role capability for $EndpointName"
 
-        # 3. 建立 Session Configuration 檔案 (.pssc)
-        Write-Host "Generating Session Configuration File: $defaultPsscPath" -ForegroundColor Cyan
-
+        Write-Step "Generating Session Configuration File: $defaultPsscPath"
         $roleDefinitions = @{}
-        foreach ($user in $RoleUsers) {
-            $roleDefinitions[$user] = @{ RoleCapabilities = $EndpointName }
-        }
+        foreach ($user in $RoleUsers) { $roleDefinitions[$user] = @{ RoleCapabilities = $EndpointName } }
 
-        if (-not (Test-Path $TranscriptPath)) {
-            New-Item $TranscriptPath -ItemType Directory -Force | Out-Null
-        }
+        if (-not (Test-Path $TranscriptPath)) { New-Item $TranscriptPath -ItemType Directory -Force | Out-Null }
 
         $psscParams = @{
-            Path               = $defaultPsscPath
-            SessionType        = 'RestrictedRemoteServer'
+            Path                = $defaultPsscPath
+            SessionType         = 'RestrictedRemoteServer'
             RunAsVirtualAccount = $true
-            RoleDefinitions    = $roleDefinitions
+            RoleDefinitions     = $roleDefinitions
             TranscriptDirectory = $TranscriptPath
         }
         if ($PSBoundParameters.ContainsKey('RunAsVirtualAccountGroups')) {
@@ -253,227 +299,136 @@ switch ($PSCmdlet.ParameterSetName) {
         }
         New-PSSessionConfigurationFile @psscParams
 
-        Write-Host "`n[Create] 完成！" -ForegroundColor Green
-        Write-Host "  .psrc : $psrcFilePath" -ForegroundColor Gray
-        Write-Host "  .pssc : $defaultPsscPath" -ForegroundColor Gray
-        Write-Host "下一步：執行 -Register 以向 WinRM 註冊此 Endpoint。" -ForegroundColor Yellow
+        Write-Done '[Create] 完成！'
+        Write-Field '.psrc' $psrcFilePath
+        Write-Field '.pssc' $defaultPsscPath
+        Write-Hint  '下一步：執行 -Register 以向 WinRM 註冊此 Endpoint。'
     }
 
-    # ════════════════════════════════════════════════════════════
-    # Register：向 WinRM 註冊 JEA Endpoint
-    # ════════════════════════════════════════════════════════════
+    # ── Register：向 WinRM 註冊 JEA Endpoint ───────────────────────────
     'Register' {
         $resolvedPssc = if ($PSBoundParameters.ContainsKey('PsscPath')) { $PsscPath } else { $defaultPsscPath }
 
         if (-not (Test-Path $resolvedPssc)) {
-            Write-Error "找不到 .pssc 檔案：$resolvedPssc`n請先執行 Create 模式，或透過 -PsscPath 指定正確路徑。"
-            return
+            Write-Error "找不到 .pssc 檔案：$resolvedPssc`n請先執行 Create 模式，或透過 -PsscPath 指定正確路徑。"; return
         }
 
-        # 驗證 .pssc 內容正確性（Microsoft 建議在 Register 前執行）
-        Write-Host "Validating session configuration file..." -ForegroundColor Cyan
+        Write-Step 'Validating session configuration file...'
         if (-not (Test-PSSessionConfigurationFile -Path $resolvedPssc)) {
-            Write-Error ".pssc 檔案驗證失敗，請檢查設定內容：$resolvedPssc"
-            return
+            Write-Error ".pssc 檔案驗證失敗，請檢查設定內容：$resolvedPssc"; return
         }
 
-        Write-Host "Registering JEA Endpoint '$EndpointName' using: $resolvedPssc" -ForegroundColor Yellow
-        Write-Host "注意：這會重新啟動 WinRM 服務。" -ForegroundColor Magenta
-
+        Write-Hint "Registering JEA Endpoint '$EndpointName'（會重新啟動 WinRM 服務）..."
         if ($PSCmdlet.ShouldProcess($EndpointName, 'Register-PSSessionConfiguration')) {
             Register-PSSessionConfiguration -Name $EndpointName -Path $resolvedPssc -Force
-            Write-Host "`n[Register] 完成！JEA Endpoint '$EndpointName' 已就緒。" -ForegroundColor Green
-            Write-Host "連線指令：Enter-PSSession -ComputerName localhost -ConfigurationName $EndpointName" -ForegroundColor Gray
+            Write-Done "[Register] 完成！JEA Endpoint '$EndpointName' 已就緒。"
+            Write-Field '連線指令' "Enter-PSSession -ComputerName localhost -ConfigurationName $EndpointName"
         }
     }
 
-    # ════════════════════════════════════════════════════════════
-    # Unregister：從 WinRM 取消 JEA Endpoint
-    # ════════════════════════════════════════════════════════════
+    # ── Unregister：從 WinRM 取消 JEA Endpoint ─────────────────────────
     'Unregister' {
-        $existing = Get-PSSessionConfiguration -Name $EndpointName -ErrorAction SilentlyContinue
-        if (-not $existing) {
-            Write-Warning "找不到已註冊的 JEA Endpoint：$EndpointName"
-            return
+        if (-not (Get-PSSessionConfiguration -Name $EndpointName -ErrorAction SilentlyContinue)) {
+            Write-Warning "找不到已註冊的 JEA Endpoint：$EndpointName"; return
         }
-
-        Write-Host "Unregistering JEA Endpoint '$EndpointName'..." -ForegroundColor Yellow
-        Write-Host "注意：這會重新啟動 WinRM 服務。" -ForegroundColor Magenta
-
+        Write-Hint "Unregistering JEA Endpoint '$EndpointName'（會重新啟動 WinRM 服務）..."
         if ($PSCmdlet.ShouldProcess($EndpointName, 'Unregister-PSSessionConfiguration')) {
             Unregister-PSSessionConfiguration -Name $EndpointName -Force
-            Write-Host "`n[Unregister] 完成！JEA Endpoint '$EndpointName' 已移除。" -ForegroundColor Green
+            Write-Done "[Unregister] 完成！JEA Endpoint '$EndpointName' 已移除。"
         }
     }
 
-    # ════════════════════════════════════════════════════════════
-    # Delete：刪除 Module 目錄（含 .psrc、.pssc、.psd1）
-    # ════════════════════════════════════════════════════════════
+    # ── Delete：刪除 Module 目錄 ──────────────────────────────────────
     'Delete' {
-        # 若 Endpoint 仍在 WinRM 中註冊，提出警告（不中斷流程）
-        $registered = Get-PSSessionConfiguration -Name $EndpointName -ErrorAction SilentlyContinue
-        if ($registered) {
+        if (Get-PSSessionConfiguration -Name $EndpointName -ErrorAction SilentlyContinue) {
             Write-Warning "JEA Endpoint '$EndpointName' 仍處於已註冊狀態。建議先執行 -Unregister 再刪除設定檔。"
         }
-
         if (-not (Test-Path $modulePath)) {
-            Write-Warning "找不到 Module 目錄，可能已刪除：$modulePath"
-            return
+            Write-Warning "找不到 Module 目錄，可能已刪除：$modulePath"; return
         }
-
-        Write-Host "Deleting Module directory: $modulePath" -ForegroundColor Yellow
-
+        Write-Hint "Deleting Module directory: $modulePath"
         if ($PSCmdlet.ShouldProcess($modulePath, 'Remove-Item -Recurse')) {
             Remove-Item -Path $modulePath -Recurse -Force
-            Write-Host "`n[Delete] 完成！已移除：$modulePath" -ForegroundColor Green
+            Write-Done "[Delete] 完成！已移除：$modulePath"
         }
     }
 
-    # ════════════════════════════════════════════════════════════
-    # List：列出所有已註冊的 JEA Endpoint
-    # ════════════════════════════════════════════════════════════
+    # ── List：列出所有已註冊的 JEA Endpoint ───────────────────────────
     'List' {
         $allEndpoints = Get-PSSessionConfiguration -ErrorAction SilentlyContinue |
             Where-Object { $_.Permission -and $_.Name -notmatch '^microsoft\.' }
+        if (-not $allEndpoints) { Write-Hint '目前沒有已註冊的 JEA Endpoint。'; return }
 
-        if (-not $allEndpoints) {
-            Write-Host '目前沒有已註冊的 JEA Endpoint。' -ForegroundColor Yellow
-            return
-        }
-
-        Write-Host "`n已註冊的 JEA Endpoint：" -ForegroundColor Cyan
+        Write-Step "`n已註冊的 JEA Endpoint："
         $allEndpoints | ForEach-Object {
-            $psscFile = Join-Path "$env:ProgramFiles\WindowsPowerShell\Modules\$($_.Name)" "$($_.Name).pssc"
             [PSCustomObject]@{
-                Name        = $_.Name
-                Enabled     = $_.Enabled
-                RunAsUser   = $_.RunAsUser
-                PSScExists  = (Test-Path $psscFile)
-                ConfigPath  = $_.ConfigFilePath
+                Name       = $_.Name
+                Enabled    = $_.Enabled
+                RunAsUser  = $_.RunAsUser
+                PSScExists = Test-Path (Get-DefaultPsscPath $_.Name)
+                ConfigPath = $_.ConfigFilePath
             }
         } | Format-Table -AutoSize
     }
 
-    # ════════════════════════════════════════════════════════════
-    # ExportSelfSignedCert：找出 WinRM HTTPS 自簽憑證並匯出
-    # ════════════════════════════════════════════════════════════
+    # ── ExportSelfSignedCert：找出 WinRM HTTPS 自簽憑證並匯出 ──────────
     'ExportSelfSignedCert' {
-        # 1. 查詢 WinRM HTTPS Listener 取得憑證指紋
-        $listenerSelector = @{ Address = '*'; Transport = 'HTTPS' }
-        $listener = $null
-        try {
-            $listener = Get-WSManInstance -ResourceURI 'winrm/config/Listener' `
-                                          -SelectorSet $listenerSelector -ErrorAction Stop
-        } catch {
-            Write-Error "找不到 WinRM HTTPS Listener，請先執行 -EnableHttps。"
-            return
-        }
+        $listener = Get-HttpsListener
+        if (-not $listener)                { Write-Error '找不到 WinRM HTTPS Listener，請先執行 -EnableHttps。'; return }
+        if (-not $listener.CertificateThumbprint) { Write-Error 'WinRM HTTPS Listener 未設定憑證指紋。'; return }
 
-        $thumbprint = $listener.CertificateThumbprint
-        if (-not $thumbprint) {
-            Write-Error "WinRM HTTPS Listener 未設定憑證指紋。"
-            return
-        }
-
-        # 2. 取得憑證物件
-        $cert = Get-Item "Cert:\LocalMachine\My\$thumbprint" -ErrorAction SilentlyContinue
+        $cert = Get-Item "Cert:\LocalMachine\My\$($listener.CertificateThumbprint)" -ErrorAction SilentlyContinue
         if (-not $cert) {
-            Write-Error "在 Cert:\LocalMachine\My 找不到指紋為 '$thumbprint' 的憑證。"
-            return
+            Write-Error "在 Cert:\LocalMachine\My 找不到指紋為 '$($listener.CertificateThumbprint)' 的憑證。"; return
         }
-
-        # 3. 確認為自簽（Issuer = Subject）
         if ($cert.Subject -ne $cert.Issuer) {
-            Write-Warning "此憑證非自簽（Issuer 與 Subject 不同），通常不需要手動匯入信任。"
-            Write-Host "  Subject : $($cert.Subject)" -ForegroundColor Gray
-            Write-Host "  Issuer  : $($cert.Issuer)"  -ForegroundColor Gray
+            Write-Warning '此憑證非自簽（Issuer 與 Subject 不同），通常不需要手動匯入信任。'
+            Write-Field 'Subject' $cert.Subject
+            Write-Field 'Issuer'  $cert.Issuer
             return
         }
 
-        # 4. 匯出 DER 編碼的 .cer（不含私鑰）
-        $certBytes = $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
-        [System.IO.File]::WriteAllBytes($ExportPath, $certBytes)
-
-        Write-Host "`n[ExportSelfSignedCert] 完成！" -ForegroundColor Green
-        Write-Host "  Subject   : $($cert.Subject)"                          -ForegroundColor Gray
-        Write-Host "  指紋      : $thumbprint"                                -ForegroundColor Gray
-        Write-Host "  到期日    : $($cert.NotAfter.ToString('yyyy-MM-dd'))"   -ForegroundColor Gray
-        Write-Host "  匯出路徑  : $ExportPath"                                -ForegroundColor Cyan
-        Write-Host "`n  於用戶端以系統管理員執行以下指令匯入信任：" -ForegroundColor Yellow
-        Write-Host "    Import-Certificate -FilePath '$ExportPath' -CertStoreLocation Cert:\LocalMachine\Root" -ForegroundColor Gray
+        Write-Done '[ExportSelfSignedCert] 完成！'
+        Write-Field 'Subject' $cert.Subject
+        Write-Field '指紋'    $cert.Thumbprint
+        Write-Field '到期日'  $cert.NotAfter.ToString('yyyy-MM-dd')
+        Export-CertToFile -Cert $cert -Path $ExportPath
     }
 
-    # ════════════════════════════════════════════════════════════
-    # EnableHttps：建立 WinRM HTTPS Listener 並開放防火牆
-    # ════════════════════════════════════════════════════════════
+    # ── EnableHttps：建立 WinRM HTTPS Listener 並開放防火牆 ────────────
     'EnableHttps' {
-        # 0. 檢查是否已存在 WinRM HTTPS Listener
-        # Get-WSManInstance 在找不到資源時拋出終止性例外，必須以 try/catch 攔截
-        $listenerSelector = @{ Address = '*'; Transport = 'HTTPS' }
-        $existing = $null
-        try {
-            $existing = Get-WSManInstance -ResourceURI 'winrm/config/Listener' `
-                                          -SelectorSet $listenerSelector -ErrorAction Stop
-        } catch {
-            # 錯誤碼 2150858752 = 資源不存在，屬預期情況，忽略即可
-            $existing = $null
-        }
+        $existing = Get-HttpsListener
         if ($existing) {
-            # 取得已使用的憑證資訊
             $existingCert = Get-Item "Cert:\LocalMachine\My\$($existing.CertificateThumbprint)" -ErrorAction SilentlyContinue
 
-            Write-Host "`n[EnableHttps] WinRM HTTPS 接聽程式已存在，無需重新設定。" -ForegroundColor Green
-            Write-Host "  Port      : $($existing.Port)" -ForegroundColor Gray
-            Write-Host "  Hostname  : $($existing.Hostname)" -ForegroundColor Gray
-            Write-Host "  憑證指紋  : $($existing.CertificateThumbprint)" -ForegroundColor Gray
+            Write-Done '[EnableHttps] WinRM HTTPS 接聽程式已存在，無需重新設定。'
+            Write-Field 'Port'     $existing.Port
+            Write-Field 'Hostname' $existing.Hostname
+            Write-Field '憑證指紋' $existing.CertificateThumbprint
             if ($existingCert) {
-                Write-Host "  憑證主體  : $($existingCert.Subject)" -ForegroundColor Gray
-                Write-Host "  憑證到期  : $($existingCert.NotAfter.ToString('yyyy-MM-dd'))" -ForegroundColor Gray
+                Write-Field '憑證主體' $existingCert.Subject
+                Write-Field '憑證到期' $existingCert.NotAfter.ToString('yyyy-MM-dd')
             }
-            # 匯出憑證（如有指定 -ExportCert）
             if ($PSBoundParameters.ContainsKey('ExportCert') -and $existingCert) {
-                $certBytes = $existingCert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
-                [System.IO.File]::WriteAllBytes($ExportCert, $certBytes)
-                Write-Host "  憑證已匯出 : $ExportCert" -ForegroundColor Cyan
-                Write-Host "  用戶端匯入 : Import-Certificate -FilePath '$ExportCert' -CertStoreLocation Cert:\LocalMachine\Root" -ForegroundColor Gray
+                Export-CertToFile -Cert $existingCert -Path $ExportCert
             }
-            # 連線提示（Self-Signed 憑證需特別處理 CA 信任）
-            $isSelfSigned = $existingCert -and ($existingCert.Subject -eq $existingCert.Issuer)
-            if ($isSelfSigned) {
-                Write-Host "`n  ※ Self-Signed 憑證 — 用戶端需擇一處理 CA 信任：" -ForegroundColor Yellow
-                Write-Host "  選項 1 略過 CA 驗證（僅限內部可信環境）：" -ForegroundColor Gray
-                Write-Host "    `$so = New-PSSessionOption -SkipCACheck -SkipCNCheck" -ForegroundColor Gray
-                if ($EndpointName) {
-                    Write-Host "    Enter-PSSession -ComputerName $($existing.Hostname) -UseSSL -Port $($existing.Port) -ConfigurationName $EndpointName -SessionOption `$so" -ForegroundColor Gray
-                } else {
-                    Write-Host "    Enter-PSSession -ComputerName $($existing.Hostname) -UseSSL -Port $($existing.Port) -SessionOption `$so" -ForegroundColor Gray
-                }
-                Write-Host "  選項 2 在用戶端匯入憑證後直接連線（建議）：" -ForegroundColor Gray
-                Write-Host "    Import-Certificate -FilePath '<.cer 路徑>' -CertStoreLocation Cert:\LocalMachine\Root" -ForegroundColor Gray
-                if ($EndpointName) {
-                    Write-Host "    Enter-PSSession -ComputerName $($existing.Hostname) -UseSSL -Port $($existing.Port) -ConfigurationName $EndpointName" -ForegroundColor Gray
-                } else {
-                    Write-Host "    Enter-PSSession -ComputerName $($existing.Hostname) -UseSSL -Port $($existing.Port)" -ForegroundColor Gray
-                }
-            } else {
-                if ($EndpointName) {
-                    Write-Host "  連線指令  : Enter-PSSession -ComputerName $($existing.Hostname) -UseSSL -Port $($existing.Port) -ConfigurationName $EndpointName" -ForegroundColor Gray
-                } else {
-                    Write-Host "  連線指令  : Enter-PSSession -ComputerName $($existing.Hostname) -UseSSL -Port $($existing.Port)" -ForegroundColor Gray
-                }
-            }
-            Write-Host "`n若要更換憑證或變更設定，請先手動移除現有接聽程式：" -ForegroundColor Yellow
+
+            Write-ConnectionHint -ComputerName $existing.Hostname -Port $existing.Port `
+                                 -EndpointName $EndpointName `
+                                 -IsSelfSigned ($existingCert -and $existingCert.Subject -eq $existingCert.Issuer)
+
+            Write-Hint "`n若要更換憑證或變更設定，請先手動移除現有接聽程式："
             Write-Host "  Remove-WSManInstance winrm/config/Listener -SelectorSet @{Address='*';Transport='HTTPS'}" -ForegroundColor Gray
             return
         }
 
-        # 1. 取得或建立憑證
+        # 取得或建立憑證
         if ($PSBoundParameters.ContainsKey('CertThumbprint')) {
             $cert = Get-Item "Cert:\LocalMachine\My\$CertThumbprint" -ErrorAction Stop
-            Write-Host "使用既有憑證：$($cert.Subject) [$CertThumbprint]" -ForegroundColor Cyan
+            Write-Step "使用既有憑證：$($cert.Subject) [$CertThumbprint]"
         } else {
-            Write-Host "建立 Self-Signed Certificate（DNS=$Hostname）..." -ForegroundColor Cyan
-            Write-Warning "Self-Signed 憑證僅適用於測試環境。正式環境請使用 CA 簽發的憑證並指定 -CertThumbprint。"
+            Write-Step "建立 Self-Signed Certificate（DNS=$Hostname）..."
+            Write-Warning 'Self-Signed 憑證僅適用於測試環境。正式環境請使用 CA 簽發的憑證並指定 -CertThumbprint。'
             $cert = New-SelfSignedCertificate -DnsName $Hostname `
                                               -CertStoreLocation 'Cert:\LocalMachine\My' `
                                               -NotAfter (Get-Date).AddYears(3) `
@@ -481,65 +436,34 @@ switch ($PSCmdlet.ParameterSetName) {
                                               -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.1')
         }
 
-        # 2. 建立 WinRM HTTPS Listener
-        if ($PSCmdlet.ShouldProcess("WinRM HTTPS Listener (Port $Port)", 'New-WSManInstance')) {
-            New-WSManInstance -ResourceURI 'winrm/config/Listener' `
-                              -SelectorSet $listenerSelector `
-                              -ValueSet @{
-                                  Hostname             = $Hostname
-                                  CertificateThumbprint = $cert.Thumbprint
-                                  Port                 = $Port
-                              } | Out-Null
+        if (-not $PSCmdlet.ShouldProcess("WinRM HTTPS Listener (Port $Port)", 'New-WSManInstance')) { return }
 
-            # 3. 開放防火牆連入規則
-            $fwRuleName = "WinRM-HTTPS-$Port"
-            if (Get-NetFirewallRule -Name $fwRuleName -ErrorAction SilentlyContinue) {
-                Write-Host "防火牆規則 '$fwRuleName' 已存在，跳過建立。" -ForegroundColor Gray
-            } else {
-                New-NetFirewallRule -Name $fwRuleName `
-                                    -DisplayName "WinRM HTTPS (Port $Port)" `
-                                    -Protocol TCP -LocalPort $Port `
-                                    -Action Allow -Direction Inbound | Out-Null
-                Write-Host "已建立防火牆規則：$fwRuleName" -ForegroundColor Cyan
-            }
+        New-WSManInstance -ResourceURI 'winrm/config/Listener' `
+                          -SelectorSet $Script:HttpsListenerSelector `
+                          -ValueSet @{
+                              Hostname              = $Hostname
+                              CertificateThumbprint = $cert.Thumbprint
+                              Port                  = $Port
+                          } | Out-Null
 
-            Write-Host "`n[EnableHttps] 完成！" -ForegroundColor Green
-            Write-Host "  憑證指紋 : $($cert.Thumbprint)" -ForegroundColor Gray
-            Write-Host "  Hostname  : $Hostname" -ForegroundColor Gray
-            Write-Host "  Port      : $Port" -ForegroundColor Gray
-            # 匯出憑證（如有指定 -ExportCert）
-            if ($PSBoundParameters.ContainsKey('ExportCert')) {
-                $certBytes = $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
-                [System.IO.File]::WriteAllBytes($ExportCert, $certBytes)
-                Write-Host "  憑證已匯出 : $ExportCert" -ForegroundColor Cyan
-                Write-Host "  用戶端匯入 : Import-Certificate -FilePath '$ExportCert' -CertStoreLocation Cert:\LocalMachine\Root" -ForegroundColor Gray
-            }
-            # 連線提示（Self-Signed 憑證需特別處理 CA 信任）
-            $isSelfSigned = ($cert.Subject -eq $cert.Issuer)
-            if ($isSelfSigned) {
-                Write-Host "`n  ※ Self-Signed 憑證 — 用戶端需擇一處理 CA 信任：" -ForegroundColor Yellow
-                Write-Host "  選項 1 略過 CA 驗證（僅限內部可信環境）：" -ForegroundColor Gray
-                Write-Host "    `$so = New-PSSessionOption -SkipCACheck -SkipCNCheck" -ForegroundColor Gray
-                if ($EndpointName) {
-                    Write-Host "    Enter-PSSession -ComputerName $Hostname -UseSSL -Port $Port -ConfigurationName $EndpointName -SessionOption `$so" -ForegroundColor Gray
-                } else {
-                    Write-Host "    Enter-PSSession -ComputerName $Hostname -UseSSL -Port $Port -SessionOption `$so" -ForegroundColor Gray
-                }
-                Write-Host "  選項 2 在用戶端匯入憑證後直接連線（建議）：" -ForegroundColor Gray
-                Write-Host "    # 先以 -ExportCert 匯出，再於用戶端以系統管理員執行：" -ForegroundColor Gray
-                Write-Host "    Import-Certificate -FilePath '<.cer 路徑>' -CertStoreLocation Cert:\LocalMachine\Root" -ForegroundColor Gray
-                if ($EndpointName) {
-                    Write-Host "    Enter-PSSession -ComputerName $Hostname -UseSSL -Port $Port -ConfigurationName $EndpointName" -ForegroundColor Gray
-                } else {
-                    Write-Host "    Enter-PSSession -ComputerName $Hostname -UseSSL -Port $Port" -ForegroundColor Gray
-                }
-            } else {
-                if ($EndpointName) {
-                    Write-Host "  連線指令  : Enter-PSSession -ComputerName $Hostname -UseSSL -Port $Port -ConfigurationName $EndpointName" -ForegroundColor Gray
-                } else {
-                    Write-Host "  連線指令  : Enter-PSSession -ComputerName $Hostname -UseSSL -Port $Port" -ForegroundColor Gray
-                }
-            }
+        # 開放防火牆連入規則
+        $fwRuleName = "WinRM-HTTPS-$Port"
+        if (Get-NetFirewallRule -Name $fwRuleName -ErrorAction SilentlyContinue) {
+            Write-Host "防火牆規則 '$fwRuleName' 已存在，跳過建立。" -ForegroundColor Gray
+        } else {
+            New-NetFirewallRule -Name $fwRuleName -DisplayName "WinRM HTTPS (Port $Port)" `
+                                -Protocol TCP -LocalPort $Port -Action Allow -Direction Inbound | Out-Null
+            Write-Step "已建立防火牆規則：$fwRuleName"
         }
+
+        Write-Done '[EnableHttps] 完成！'
+        Write-Field '憑證指紋' $cert.Thumbprint
+        Write-Field 'Hostname' $Hostname
+        Write-Field 'Port'     $Port
+        if ($PSBoundParameters.ContainsKey('ExportCert')) { Export-CertToFile -Cert $cert -Path $ExportCert }
+
+        Write-ConnectionHint -ComputerName $Hostname -Port $Port `
+                             -EndpointName $EndpointName `
+                             -IsSelfSigned ($cert.Subject -eq $cert.Issuer)
     }
 }

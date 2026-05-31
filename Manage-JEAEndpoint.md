@@ -41,7 +41,7 @@
 
 | 參數 | 類型 | 必填模式 | 說明 |
 |---|---|---|---|
-| `-EndpointName` | `String` | Create / Register / Unregister / Delete | JEA 工作階段設定名稱，同時作為 PowerShell 模組名稱與角色能力名稱（三者必須一致）。 |
+| `-EndpointName` | `String` | Create / Register / Unregister / Delete（EnableHttps 選填） | JEA 工作階段設定名稱，同時作為 PowerShell 模組名稱與角色能力名稱（三者必須一致）。在 EnableHttps 模式指定時，腳本會在完成訊息中附上包含 `-ConfigurationName` 的連線指令。 |
 
 ### Create 模式
 
@@ -83,8 +83,7 @@
 |---|---|---|---|---|
 | `-EnableHttps` | `Switch` | 是 | — | 切換至 EnableHttps 模式。 |
 | `-CertThumbprint` | `String` | 否 | （自動建立自我簽署憑證） | 位於 `Cert:\LocalMachine\My` 的憑證指紋。**正式環境請使用 CA 簽發的憑證**並透過此參數指定，省略時腳本會自動建立僅供測試用的自我簽署憑證。 |
-| `-EndpointName` | `String` | 否 | — | 選填。若指定，完成後會顯示包含 `-ConfigurationName` 的完整連線指令。 |
-| `-Hostname` | `String` | 否 | `$env:COMPUTERNAME` | WinRM HTTPS 接聽程式與憑證所使用的 DNS 名稱。 |
+| `-Hostname` | `String` | 否 | `$env:COMPUTERNAME` | WinRM HTTPS 接聽程式與憑證所使用的 DNS 名稱。**跨網域情境請指定用戶端可解析的 FQDN**，否則用戶端連線時會因名稱不符而驗證失敗。 |
 | `-Port` | `Int` | 否 | `5986` | WinRM HTTPS 接聽埠，有效範圍 1–65535。 |
 | `-ExportCert` | `String` | 否 | — | 同步將憑證匯出為 .cer 檔案的完整路徑，供用戶端以 `Import-Certificate` 匯入信任後直接連線（不需 `-SkipCACheck`）。 |
 
@@ -343,7 +342,7 @@ Enter-PSSession -ComputerName PDC -UseSSL -ConfigurationName HelpDesk
 # 彈出 Get-Credential 對話框，輸入遠端電腦的本機或網域帳號
 $cred = Get-Credential -Message "請輸入 PDC 的帳號密碼" -UserName "PDC\Administrator"
 
-# 透過 HTTP（需先確認 WinRM 允許非加密連線，或位於可信任網路）
+# 透過 HTTP（跨網域需在用戶端先設定 TrustedHosts，見下方補充）
 Enter-PSSession -ComputerName PDC `
                 -ConfigurationName HelpDesk `
                 -Credential $cred
@@ -354,9 +353,10 @@ Enter-PSSession -ComputerName PDC `
                 -ConfigurationName HelpDesk `
                 -Credential $cred
 
-# 若使用自我簽署憑證且未匯入
+# 若使用自我簽署憑證且未匯入用戶端
 Enter-PSSession -ComputerName PDC -UseSSL `
                 -ConfigurationName HelpDesk `
+                -Credential $cred `
                 -SessionOption (New-PSSessionOption -SkipCACheck -SkipCNCheck)
 ```
 
@@ -375,11 +375,25 @@ Remove-PSSession $session
 
 #### 驗證方式選擇
 
-| 情境 | `-Authentication` 建議值 | 說明 |
+| 情境 | 建議連線方式 | 說明 |
 |---|---|---|
-| 相同 AD 網域 | `Negotiate`（預設） | Kerberos 優先，自動降級為 NTLM |
-| 跨網域 / 工作群組 + HTTPS | `Negotiate` | 搭配 `-UseSSL` 保護認證傳輸 |
-| 跨網域 / 工作群組 + HTTP | `Basic` + SSL | **不建議**；若無 SSL 認證資訊將以明文傳送 |
+| 相同 AD 網域 | `-UseSSL`，默認 Kerberos | 不需 `-Credential`，以當前使用者身分驗證 |
+| 跨網域 / 工作群組 + HTTPS（**推薦**） | `-UseSSL -Credential $cred` | SSL 憑證並可信賴時認證資訊受加密保護 |
+| 跨網域 / 工作群組 + HTTP | `-Credential $cred` + TrustedHosts | 需在用戶端設定 `TrustedHosts`；**認證資訊未加密**，僅限可信網路 |
+
+#### 跨網域 HTTP 連線前置：設定 TrustedHosts（仅限 HTTP）
+
+用戶端預設不信任任何跨網域的 HTTP 遠端主機，需先以系統管理員執行：
+
+```powershell
+# 只信任特定主機（推薦）
+Set-Item WSMan:\localhost\Client\TrustedHosts -Value 'PDC' -Concatenate -Force
+
+# 查詢現有設定
+Get-Item WSMan:\localhost\Client\TrustedHosts
+```
+
+> HTTPS 連線以憑證識別伺服器身分，**不需**設定 TrustedHosts。
 
 > **安全提示**：跨網域連線請務必搭配 `-UseSSL`，確保帳號密碼在傳輸過程中受到加密保護。  
 > 請勿在腳本中以明文儲存密碼；自動化場景建議搭配 Windows Credential Manager 或 Azure Key Vault。
